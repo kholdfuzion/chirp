@@ -16,6 +16,8 @@
 
 import logging
 
+import time
+
 from chirp.drivers import baofeng_common as bfc
 from chirp import chirp_common, directory, memmap, bandplan_na
 from chirp import bitwise
@@ -2352,17 +2354,22 @@ class UV5RMini(UV17Pro):
     LIST_DTMFSPEED = ["%s ms" % x for x in [50, 100, 200, 300, 400, 500]]
     LIST_SKEY2_SHORT = ["FM Radio", "Scan", "Search", "VOX", "Flashlight",
                         "SOS"]
+    # OEM CPS layout:
+    #   0x0000..0x7CFF : 1000 x 32-byte channels
+    #   0x8000..0x803F : VFO A/B block
+    #   0x9000..0x903F : settings block
+    #   0xA000..0xA1BF : ANI/PTTID/DTMF blocks
+    MEM_STARTS = [0x0000, 0x8000, 0x9000, 0xA000]
+    MEM_SIZES = [0x7D00, 0x0040, 0x0040, 0x01C0]
 
-    MEM_STARTS = [0x0000, 0x9000, 0xA000]
-    MEM_SIZES = [0x8040, 0x0040, 0x01C0]
-
-    MEM_TOTAL = 0x8240
+    MEM_TOTAL = 0x7F40
 
     _is_on_ble = False
 
     _has_support_for_banknames = False
     _has_bt = True  # allow BT setting
 
+    # UV-5R Mini uses PROGRAMCOLORPROU (= MSTRING_UV17PROGPS).
     _idents = [MSTRING_UV17PROGPS]
     _mem_size = MEM_TOTAL
     _has_voxsw = True
@@ -2370,11 +2377,41 @@ class UV5RMini(UV17Pro):
     _has_send_id_delay = True
     _has_skey1_short = True
     _mem_params = {
-        'mems': 999,
-        'ani': 0x8080,
-        'pttid': 0x80A0,
+        'mems': 1000,
+        'ani': 0x7D80,
+        'pttid': 0x7DA0,
     }
-    CHANNELS = 999
+    CHANNELS = 1000
+
+    MEM_FORMAT = """
+    struct memory_obj memory[%(mems)i];
+
+    #seekto 0x7D00;
+    struct {
+      struct vfo_entry a;
+      struct vfo_entry b;
+    } vfo;
+
+    struct settings_obj settings;
+    #seekto 0x%(ani)X;
+    struct ani_obj ani;
+
+    #seekto 0x%(pttid)04X;
+    struct {
+      u8 code[5];
+      char name[10];
+      u8 unused;
+    } pttid[20];
+
+    struct {
+      u8 unknown32[32];
+      u8 code[16];
+    } upcode;
+
+    struct {
+      u8 code[16];
+    } downcode;
+    """
 
     STEPS = [2.5, 5.0, 6.25, 8.33, 10.0, 12.5, 20.0, 25.0, 50.0]
 
@@ -2400,11 +2437,99 @@ class UV5RMini(UV17Pro):
         LOG.debug('Detected BLE: %s' % self._is_on_ble)
         return super().sync_out()
 
-    def _upload(radio):
+    @staticmethod
+    def _do_ident(radio):
+        """Handshake matching the OEM CPS state machine for the UV-5R Mini.
+
+        The CPS (FormProgress/Communication.cs) flow is:
+          1. Send PROGRAMCOLORPROU, wait for 0x06 ACK
+          2. Send 'F' (0x46), read 16-byte frequency-range block
+          3. Send 'M' (0x4D), sleep 100 ms, then drain all available bytes
+             (model string, e.g. b'5RMINI\\x00\\x00') – length is variable
+          4. Send 25-byte SEND packet (encryption-key negotiation), wait 0x06
+
+        The generic _do_ident() reads a fixed 15 bytes for step 3, which
+        fails when the radio sends fewer bytes and the 1.5 s timeout fires.
+        """
+        bfc._clean_buffer(radio)
+
+        # --- Step 1: PROGRAMCOLORPROU → 0x06 ---
+        LOG.debug('UV5RMini: sending ident PROGRAMCOLORPROU')
+        bfc._rawsend(radio, MSTRING_UV17PROGPS)
+        ack = bfc._rawrecv(radio, 1)
+        if ack != b'\x06':
+            raise errors.RadioError(
+                'UV-5R Mini: unexpected ident ACK %r (expected 0x06)' % ack)
+
+        # --- Step 2: 'F' → 16-byte frequency range ---
+        bfc._rawsend(radio, b'\x46')
+        freq_range = bfc._rawrecv(radio, 16)
+        LOG.debug('UV5RMini: freq_range=%r', freq_range)
+
+        # --- Step 3: 'M' → variable-length model string ---
+        bfc._rawsend(radio, b'\x4D')
+        time.sleep(0.1)          # CPS does Thread.Sleep(100) here
+        radio.pipe.timeout = 0.3
+        model_bytes = radio.pipe.read(32)   # drain whatever the radio sent
+        radio.pipe.timeout = bfc.STIMEOUT
+        model_str = model_bytes.rstrip(b'\xff\x00 ').decode(
+            'ascii', errors='replace')
+        LOG.debug('UV5RMini: model_str=%r', model_str)
+        if '5RMINI' not in model_str.upper():
+            raise errors.RadioError(
+                'UV-5R Mini model check failed: radio returned %r' % model_str)
+
+        # --- Step 4: SEND (encryption-key negotiation) → 0x06 ---
+        # Fixed SEND packet selecting encryption key index 1 ("CO 7"),
+        # matching _encrsym = 1 used throughout this driver family.
+        send_magic = (b'\x53\x45\x4E\x44'            # "SEND"
+                      b'\x21\x05\x0D\x01\x01\x01'
+                      b'\x04\x11\x08\x05\x0D\x0D'
+                      b'\x01\x11\x0F\x09\x12\x09'
+                      b'\x10\x04\x00')
+        bfc._rawsend(radio, send_magic)
+        ack2 = bfc._rawrecv(radio, 1)
+        if ack2 != b'\x06':
+            raise errors.RadioError(
+                'UV-5R Mini SEND ACK failed: %r' % ack2)
+
+    def _download(self):
+        """Download from UV-5R Mini using the CPS-faithful ident."""
+        radio = self
+        UV5RMini._do_ident(radio)
+
+        data = b""
+        status = chirp_common.Status()
+        status.cur = 0
+        status.max = radio.MEM_TOTAL // radio.BLOCK_SIZE
+        status.msg = "Cloning from radio..."
+        radio.status_fn(status)
+
+        for i in range(len(radio.MEM_SIZES)):
+            MEM_SIZE = radio.MEM_SIZES[i]
+            MEM_START = radio.MEM_STARTS[i]
+            for addr in range(MEM_START, MEM_START + MEM_SIZE,
+                              radio.BLOCK_SIZE):
+                frame = radio._make_read_frame(addr, radio.BLOCK_SIZE)
+                bfc._rawsend(radio, frame)
+                d = bfc._rawrecv(radio, radio.BLOCK_SIZE + 4)
+                if radio._uses_encr:
+                    d = _crypt(radio._encrsym, d[4:])
+                else:
+                    d = d[4:]
+                data += d
+                status.cur = len(data) // radio.BLOCK_SIZE
+                radio.status_fn(status)
+        return data
+
+    download_function = lambda self: self._download()
+
+    def _upload(self):
         """Upload to UV5R Mini (over BLE or USB/Serial)"""
+        radio = self
         # Put radio in program mode and identify it and
         # determine if on BLE or USB/Serial connection
-        _do_ident(radio)
+        UV5RMini._do_ident(radio)
 
         if radio._is_on_ble:  # BLE upload needs a diff blocksize
             _blocksize = radio.BLE_UP_BLOCK_SIZE
@@ -2460,11 +2585,10 @@ class UV5RMini(UV17Pro):
                 radio.status_fn(status)
 
         return data
-
-    upload_function = _upload
+    upload_function = lambda self: self._upload()
 
     _end_fmt = """
-    // #seekto 0x8220;
+    // #seekto 0x7F20;
     struct {
       u8 unknown1[32];
     } modes;
